@@ -4,19 +4,22 @@ from .pager import Pager, PAGE_SIZE
 from .row import Row, ROW_SIZE
 
 # ---------- node layout (every node is exactly one page) ----------
-# Header (8 bytes): node_type (1) | unused (1) | num_keys (2) | link (4)
+# Common header (8 bytes): node_type (1) | unused (1) | num_keys (2) | link (4)
 #   leaf:     link = page number of the next leaf (0 = none)
 #   internal: link = right_child (the child for keys > the last key)
 NODE_HEADER = struct.Struct("<BBHI")
 LEAF, INTERNAL = 1, 2
-HEADER_SIZE = NODE_HEADER.size                            # 8
+HEADER_SIZE = NODE_HEADER.size                        # 8
 
-LEAF_CELL_SIZE = 4 + ROW_SIZE                             # key + row = 295 bytes
-LEAF_MAX = (PAGE_SIZE - HEADER_SIZE) // LEAF_CELL_SIZE    # 13 rows per leaf
-INTERNAL_MAX = (PAGE_SIZE - HEADER_SIZE) // 8             # 511 keys per internal node
+# Leaf cell: key (4) + row (291) = 295 bytes
+LEAF_CELL_SIZE = 4 + ROW_SIZE
+LEAF_MAX = (PAGE_SIZE - HEADER_SIZE) // LEAF_CELL_SIZE   # 13
+
+# Internal cell: child page (4) + key (4) = 8 bytes
+INTERNAL_MAX = (PAGE_SIZE - HEADER_SIZE) // 8            # 511
 
 U32 = struct.Struct("<I")
-INTERNAL_CELL = struct.Struct("<II")                      # child page, key
+INTERNAL_CELL = struct.Struct("<II")
 
 
 class DuplicateKey(Exception):
@@ -32,7 +35,7 @@ def write_header(page, node_type, num_keys, link):
     NODE_HEADER.pack_into(page, 0, node_type, 0, num_keys, link)
 
 
-# ---- leaf: read into / write from a list of (key, row_bytes) ----
+# ---- leaf helpers: a leaf is read into / written from a list of (key, row_bytes) ----
 def read_leaf(page):
     _, n, next_leaf = read_header(page)
     cells = []
@@ -51,7 +54,8 @@ def write_leaf(page, cells, next_leaf):
         page[off + 4: off + LEAF_CELL_SIZE] = row_bytes
 
 
-# ---- internal: keys[i] = largest key under children[i]; children[-1] = right child ----
+# ---- internal helpers: children has one more entry than keys ----
+# keys[i] = largest key in the subtree of children[i]; children[-1] is the right child
 def read_internal(page):
     _, n, right_child = read_header(page)
     keys, children = [], []
@@ -70,6 +74,9 @@ def write_internal(page, keys, children):
 
 
 class BTree:
+    """B+Tree keyed by uint32 id. Rows live only in leaves; leaves are linked
+    left-to-right so a scan never has to go back up the tree."""
+
     def __init__(self, pager: Pager, root: int):
         self.pager = pager
         self.root = root
@@ -77,8 +84,9 @@ class BTree:
     @classmethod
     def create(cls, pager: Pager) -> "BTree":
         root = pager.allocate_page()
-        write_leaf(pager.get_page(root), [], 0)
-        pager.mark_dirty(root)
+        page = pager.get_page(root)
+        write_leaf(page, [], 0)
+        pager.mark_dirty(root, page)
         return cls(pager, root)
 
     def _node_type(self, page_num):
@@ -100,7 +108,7 @@ class BTree:
         return None
 
     def scan(self, lo=0, hi=2**32 - 1):
-        """Rows with lo <= id <= hi, in order, by walking the linked leaves."""
+        """Yield rows with lo <= id <= hi, in key order, by walking linked leaves."""
         page_num = self._find_leaf(lo)
         while page_num:
             cells, next_leaf = read_leaf(self.pager.get_page(page_num))
@@ -114,17 +122,18 @@ class BTree:
     # ---------- insert ----------
     def insert(self, key, row_bytes):
         split = self._insert(self.root, key, row_bytes)
-        if split:                       # the root split: tree grows one level
+        if split:  # the root itself split: grow the tree by one level
             sep_key, new_page = split
             new_root = self.pager.allocate_page()
-            write_internal(self.pager.get_page(new_root), [sep_key], [self.root, new_page])
-            self.pager.mark_dirty(new_root)
+            root_page = self.pager.get_page(new_root)
+            write_internal(root_page, [sep_key], [self.root, new_page])
+            self.pager.mark_dirty(new_root, root_page)
             self.root = new_root
 
     def _insert(self, page_num, key, row_bytes):
-        """Returns None, or (sep_key, new_page) if this node split."""
+        """Insert into the subtree at page_num. Returns None, or (sep_key, new_page)
+        if this node split: page_num keeps keys <= sep_key, new_page gets the rest."""
         page = self.pager.get_page(page_num)
-
         if read_header(page)[0] == LEAF:
             cells, next_leaf = read_leaf(page)
             keys = [k for k, _ in cells]
@@ -132,19 +141,21 @@ class BTree:
             if i < len(keys) and keys[i] == key:
                 raise DuplicateKey(f"Duplicate key {key}.")
             cells.insert(i, (key, row_bytes))
-            self.pager.mark_dirty(page_num)
             if len(cells) <= LEAF_MAX:
                 write_leaf(page, cells, next_leaf)
+                self.pager.mark_dirty(page_num, page)
                 return None
-            # LEAF SPLIT: left half stays, right half moves to a new page
+            # leaf split: left half stays, right half moves to a new page
             mid = len(cells) // 2
             new_page = self.pager.allocate_page()
-            write_leaf(self.pager.get_page(new_page), cells[mid:], next_leaf)
-            write_leaf(page, cells[:mid], new_page)       # left -> new -> old next
-            self.pager.mark_dirty(new_page)
+            right = self.pager.get_page(new_page)
+            write_leaf(right, cells[mid:], next_leaf)
+            self.pager.mark_dirty(new_page, right)
+            write_leaf(page, cells[:mid], new_page)          # relink: left -> new -> old next
+            self.pager.mark_dirty(page_num, page)
             return cells[mid - 1][0], new_page
 
-        # INTERNAL: go down into the right child, then absorb its split
+        # internal node: recurse into the right child, then absorb its split
         keys, children = read_internal(page)
         i = bisect_left(keys, key)
         split = self._insert(children[i], key, row_bytes)
@@ -153,16 +164,18 @@ class BTree:
         sep_key, new_child = split
         keys.insert(i, sep_key)
         children.insert(i + 1, new_child)
-        self.pager.mark_dirty(page_num)
         if len(keys) <= INTERNAL_MAX:
             write_internal(page, keys, children)
+            self.pager.mark_dirty(page_num, page)
             return None
-        # INTERNAL SPLIT: the middle key moves UP (kept in neither half)
+        # internal split: the middle key moves UP, it is not kept in either half
         mid = len(keys) // 2
         new_page = self.pager.allocate_page()
-        write_internal(self.pager.get_page(new_page), keys[mid + 1:], children[mid + 1:])
+        right = self.pager.get_page(new_page)
+        write_internal(right, keys[mid + 1:], children[mid + 1:])
+        self.pager.mark_dirty(new_page, right)
         write_internal(page, keys[:mid], children[:mid + 1])
-        self.pager.mark_dirty(new_page)
+        self.pager.mark_dirty(page_num, page)
         return keys[mid], new_page
 
     # ---------- debugging ----------
@@ -173,9 +186,9 @@ class BTree:
             d += 1
         return d
 
-    def print_tree(self, max_lines=60):
+    def print_tree(self, page_num=None, indent=0, max_lines=60):
         lines = []
-        self._print(self.root, 0, lines)
+        self._print(self.root if page_num is None else page_num, indent, lines)
         if len(lines) > max_lines:
             lines = lines[:max_lines] + [f"... ({len(lines) - max_lines} more lines)"]
         return "\n".join(lines)

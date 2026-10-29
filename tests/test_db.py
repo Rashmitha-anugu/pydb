@@ -82,3 +82,38 @@ def test_too_long_rejected(path):
 def test_negative_id_rejected(path):
     with pytest.raises(RowError):
         Table(path).insert(Row(-1, "a", "b"))
+
+
+# ---------- Milestone 4: LRU buffer pool ----------
+@pytest.mark.parametrize("cache_pages", [1, 2, 3, 8])
+def test_tiny_cache_never_loses_data(path, cache_pages):
+    ids = random.Random(7).sample(range(1_000_000), 8_000)
+    t = Table(path, cache_pages=cache_pages)
+    for i in ids:
+        t.insert(row(i))
+    assert len(t.pager._cache) <= cache_pages
+    assert t.pager.evictions > 0
+    t.close()
+
+    t2 = Table(path, cache_pages=cache_pages)
+    assert [r.id for r in t2.select_all()] == sorted(ids)
+    for i in ids[:300]:
+        assert t2.find(i) == row(i)
+
+
+def test_bigger_cache_means_higher_hit_rate(path):
+    ids = random.Random(1).sample(range(1_000_000), 10_000)
+    t = Table(path, cache_pages=4096)
+    for i in ids:
+        t.insert(row(i))
+    t.close()
+
+    lookups = random.Random(2).choices(ids, k=3_000)
+    rates = {}
+    for size in (4, 64, 1024):
+        t = Table(path, cache_pages=size)
+        for i in lookups:
+            t.find(i)
+        rates[size] = t.pager.hit_rate()
+        t.close()
+    assert rates[4] < rates[64] < rates[1024]
