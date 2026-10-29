@@ -11,10 +11,12 @@ HELP = """Commands:
                              e.g.  create id:int name:text(32) email:text(255)? age:int? active:bool
   insert <v1> <v2> ...       values in column order; use null for NULL, quotes for spaces: 'Ana Silva'
   find <id>                  one row by primary key
+  find <column> <value>      rows where column = value (null for IS NULL); uses an index if one exists
+  index <column>             build a secondary index on a column
   select                     all rows, sorted by key
   select <id>                one row
   select <from> <to>         rows with key between from and to
-  .schema  .stats  .btree  .help  .exit"""
+  .schema  .indexes  .stats  .btree  .help  .exit"""
 
 
 def execute(state: dict, line: str) -> str:
@@ -48,11 +50,32 @@ def execute(state: dict, line: str) -> str:
         except (SchemaError, DuplicateKey) as e:
             return f"Error: {e}"
 
+    if cmd == "index":
+        if len(parts) != 2:
+            return "Syntax error. Usage: index <column>"
+        try:
+            count = table.create_index(parts[1])
+        except SchemaError as e:
+            return f"Error: {e}"
+        return f"Index on '{parts[1]}' created ({count} rows indexed)."
+
     if cmd == "find":
-        if len(parts) != 2 or not parts[1].isdigit():
-            return "Syntax error. Usage: find <id>"
-        row = table.find(int(parts[1]))
-        return table.schema.format_row(row) if row else "Not found."
+        if len(parts) == 2 and parts[1].isdigit():
+            row = table.find(int(parts[1]))
+            return table.schema.format_row(row) if row else "Not found."
+        if len(parts) == 3:
+            try:
+                col = table.schema.column(parts[1])
+                value = table.schema.parse_value(col, parts[2])
+                before = table.pager.hits + table.pager.misses
+                rows = table.find_by(parts[1], value)
+            except SchemaError as e:
+                return f"Error: {e}"
+            pages = table.pager.hits + table.pager.misses - before
+            lines = [table.schema.format_row(r) for r in rows]
+            lines.append(f"({len(rows)} row(s) via {table.last_lookup}, {pages} pages touched)")
+            return "\n".join(lines)
+        return "Syntax error. Usage: find <id>  |  find <column> <value>"
 
     if cmd == "select":
         if len(parts) == 1:
@@ -82,8 +105,13 @@ def meta(state: dict, line: str) -> str:
                 f"cache: {len(p._cache)}/{p.capacity} pages, hit_rate={p.hit_rate():.1%} "
                 f"(hits={p.hits} misses={p.misses}) evictions={p.evictions}\n"
                 f"disk: reads={p.reads} writes={p.writes}")
+    if line == ".indexes":
+        if not table.indexes:
+            return "No secondary indexes. Create one with: index <column>"
+        return "\n".join(f"{n}: {t.depth()} levels, root p{t.root}, {t.leaf_max} entries per leaf"
+                         for n, t in table.indexes.items())
     if line == ".btree":
-        return table.tree.print_tree()
+        return table.tree.print_tree(fmt=lambda k: int.from_bytes(k, "big"))
     return f"Unrecognized command '{line}'. Type .help"
 
 

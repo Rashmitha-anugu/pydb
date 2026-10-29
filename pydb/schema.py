@@ -65,6 +65,15 @@ class Schema:
         if self.row_size > MAX_ROW_SIZE:
             raise SchemaError(f"Row is {self.row_size} bytes; the maximum is {MAX_ROW_SIZE}.")
 
+    def column(self, name: str) -> Column:
+        for c in self.columns:
+            if c.name == name:
+                return c
+        raise SchemaError(f"No column named '{name}'. Columns: {', '.join(c.name for c in self.columns)}")
+
+    def position(self, name: str) -> int:
+        return [c.name for c in self.columns].index(self.column(name).name)
+
     @classmethod
     def parse(cls, specs):
         return cls(parse_column(s) for s in specs)
@@ -78,28 +87,33 @@ class Schema:
         return cls(Column(*c) for c in json.loads(data))
 
     # ---------- validation ----------
+    @staticmethod
+    def check_value(col: Column, v) -> None:
+        """Raise SchemaError if v cannot be stored in col."""
+        if v is None:
+            if not col.nullable:
+                raise SchemaError(f"Column '{col.name}' cannot be NULL.")
+            return
+        if col.type == "int":
+            if not isinstance(v, int) or isinstance(v, bool):
+                raise SchemaError(f"Column '{col.name}' needs an int.")
+            if not -2**63 <= v < 2**63:
+                raise SchemaError(f"Column '{col.name}' is out of range for int.")
+        elif col.type == "bool" and not isinstance(v, bool):
+            raise SchemaError(f"Column '{col.name}' needs true/false.")
+        elif col.type == "float" and (not isinstance(v, (int, float)) or isinstance(v, bool)):
+            raise SchemaError(f"Column '{col.name}' needs a number.")
+        elif col.type == "text":
+            if not isinstance(v, str):
+                raise SchemaError(f"Column '{col.name}' needs text.")
+            if len(v.encode()) > col.size:
+                raise SchemaError(f"Column '{col.name}' is longer than {col.size} bytes.")
+
     def validate(self, values) -> None:
         if len(values) != len(self.columns):
             raise SchemaError(f"Expected {len(self.columns)} values, got {len(values)}.")
         for col, v in zip(self.columns, values):
-            if v is None:
-                if not col.nullable:
-                    raise SchemaError(f"Column '{col.name}' cannot be NULL.")
-                continue
-            if col.type == "int":
-                if not isinstance(v, int) or isinstance(v, bool):
-                    raise SchemaError(f"Column '{col.name}' needs an int.")
-                if not -2**63 <= v < 2**63:
-                    raise SchemaError(f"Column '{col.name}' is out of range for int.")
-            elif col.type == "bool" and not isinstance(v, bool):
-                raise SchemaError(f"Column '{col.name}' needs true/false.")
-            elif col.type == "float" and (not isinstance(v, (int, float)) or isinstance(v, bool)):
-                raise SchemaError(f"Column '{col.name}' needs a number.")
-            elif col.type == "text":
-                if not isinstance(v, str):
-                    raise SchemaError(f"Column '{col.name}' needs text.")
-                if len(v.encode()) > col.size:
-                    raise SchemaError(f"Column '{col.name}' is longer than {col.size} bytes.")
+            self.check_value(col, v)
         if not 0 <= values[0] <= MAX_KEY:
             raise SchemaError(f"Primary key must be between 0 and {MAX_KEY}.")
 
@@ -134,12 +148,20 @@ class Schema:
         return tuple(values)
 
     # ---------- text input from the REPL ----------
+    def parse_value(self, col: Column, tok: str):
+        """One REPL string -> typed value for this column."""
+        return self.parse_values_for([col], [tok])[0]
+
     def parse_values(self, tokens) -> tuple:
-        """Turn REPL strings into typed values: 'null', 'true', '42', '3.5', 'alice'."""
         if len(tokens) != len(self.columns):
             raise SchemaError(f"Expected {len(self.columns)} values ({self}), got {len(tokens)}.")
+        return self.parse_values_for(self.columns, tokens)
+
+    @staticmethod
+    def parse_values_for(columns, tokens) -> tuple:
+        """Turn REPL strings into typed values: 'null', 'true', '42', '3.5', 'alice'."""
         out = []
-        for col, tok in zip(self.columns, tokens):
+        for col, tok in zip(columns, tokens):
             if tok.lower() == "null":
                 out.append(None)
             elif col.type == "int":

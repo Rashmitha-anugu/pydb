@@ -2,19 +2,18 @@ import struct
 from bisect import bisect_left
 from .pager import Pager, PAGE_SIZE
 
-# ---------- node layout (every node is exactly one page) ----------
-# Common header (8 bytes): node_type (1) | unused (1) | num_keys (2) | link (4)
-#   leaf:     link = page number of the next leaf (0 = none)
-#   internal: link = right_child (the child for keys > the last key)
+# A B+Tree mapping fixed-size BYTE keys -> fixed-size byte values.
+# Keys are compared as raw bytes (b"abc" < b"abd"), so callers encode their keys
+# so that byte order == the order they want (see keys.py).
+#
+# Node header (8 bytes): node_type (1) | unused (1) | num_keys (2) | link (4)
+#   leaf:     link = next leaf page (0 = none)      cells: key | value
+#   internal: link = right child                    cells: child page (4) | key
 NODE_HEADER = struct.Struct("<BBHI")
 LEAF, INTERNAL = 1, 2
-HEADER_SIZE = NODE_HEADER.size                            # 8
-
-# Internal cell: child page (4) + key (4) = 8 bytes
-INTERNAL_MAX = (PAGE_SIZE - HEADER_SIZE) // 8             # 511
-
+HEADER_SIZE = NODE_HEADER.size
 U32 = struct.Struct("<I")
-INTERNAL_CELL = struct.Struct("<II")
+MAX_KEY_SIZE = 1000          # keeps at least 3 keys per internal node
 
 
 class DuplicateKey(Exception):
@@ -30,63 +29,61 @@ def write_header(page, node_type, num_keys, link):
     NODE_HEADER.pack_into(page, 0, node_type, 0, num_keys, link)
 
 
-# ---- internal: keys[i] = largest key under children[i]; children[-1] = right child ----
-def read_internal(page):
-    _, n, right_child = read_header(page)
-    keys, children = [], []
-    for i in range(n):
-        child, key = INTERNAL_CELL.unpack_from(page, HEADER_SIZE + i * 8)
-        children.append(child)
-        keys.append(key)
-    children.append(right_child)
-    return keys, children
-
-
-def write_internal(page, keys, children):
-    write_header(page, INTERNAL, len(keys), children[-1])
-    for i, key in enumerate(keys):
-        INTERNAL_CELL.pack_into(page, HEADER_SIZE + i * 8, children[i], key)
-
-
 class BTree:
-    """B+Tree mapping a uint32 key -> a fixed-size block of row bytes.
-    The tree does not know what is inside a row; the table's schema decodes it."""
-
-    def __init__(self, pager: Pager, root: int, row_size: int):
+    def __init__(self, pager: Pager, root: int, key_size: int, value_size: int):
+        if key_size > MAX_KEY_SIZE:
+            raise ValueError(f"Keys of {key_size} bytes are too large (max {MAX_KEY_SIZE}).")
         self.pager = pager
         self.root = root
-        self.row_size = row_size
-        self.leaf_cell_size = 4 + row_size                     # key + row
+        self.key_size = key_size
+        self.value_size = value_size
+        self.leaf_cell_size = key_size + value_size
+        self.internal_cell_size = 4 + key_size
         self.leaf_max = (PAGE_SIZE - HEADER_SIZE) // self.leaf_cell_size
-        self.internal_max = INTERNAL_MAX
+        self.internal_max = (PAGE_SIZE - HEADER_SIZE) // self.internal_cell_size
         if self.leaf_max < 2:
-            raise ValueError("Rows are too large to fit 2 per page.")
+            raise ValueError("Entries are too large to fit 2 per page.")
 
     @classmethod
-    def create(cls, pager: Pager, row_size: int) -> "BTree":
+    def create(cls, pager: Pager, key_size: int, value_size: int) -> "BTree":
         root = pager.allocate_page()
-        tree = cls(pager, root, row_size)
+        tree = cls(pager, root, key_size, value_size)
         page = pager.get_page(root)
         tree.write_leaf(page, [], 0)
         pager.mark_dirty(root, page)
         return tree
 
-    # ---- leaf: read into / write from a list of (key, row_bytes) ----
+    # ---------- node <-> python lists ----------
     def read_leaf(self, page):
         _, n, next_leaf = read_header(page)
-        cells = []
+        cells, ks = [], self.key_size
         for i in range(n):
             off = HEADER_SIZE + i * self.leaf_cell_size
-            key = U32.unpack_from(page, off)[0]
-            cells.append((key, bytes(page[off + 4: off + self.leaf_cell_size])))
+            cells.append((bytes(page[off:off + ks]), bytes(page[off + ks:off + self.leaf_cell_size])))
         return cells, next_leaf
 
     def write_leaf(self, page, cells, next_leaf):
         write_header(page, LEAF, len(cells), next_leaf)
-        for i, (key, row_bytes) in enumerate(cells):
+        for i, (key, value) in enumerate(cells):
             off = HEADER_SIZE + i * self.leaf_cell_size
-            U32.pack_into(page, off, key)
-            page[off + 4: off + self.leaf_cell_size] = row_bytes
+            page[off:off + self.leaf_cell_size] = key + value
+
+    def read_internal(self, page):
+        _, n, right_child = read_header(page)
+        keys, children = [], []
+        for i in range(n):
+            off = HEADER_SIZE + i * self.internal_cell_size
+            children.append(U32.unpack_from(page, off)[0])
+            keys.append(bytes(page[off + 4:off + self.internal_cell_size]))
+        children.append(right_child)
+        return keys, children
+
+    def write_internal(self, page, keys, children):
+        write_header(page, INTERNAL, len(keys), children[-1])
+        for i, key in enumerate(keys):
+            off = HEADER_SIZE + i * self.internal_cell_size
+            U32.pack_into(page, off, children[i])
+            page[off + 4:off + self.internal_cell_size] = key
 
     def _node_type(self, page_num):
         return read_header(self.pager.get_page(page_num))[0]
@@ -95,43 +92,43 @@ class BTree:
     def _find_leaf(self, key):
         page_num = self.root
         while self._node_type(page_num) == INTERNAL:
-            keys, children = read_internal(self.pager.get_page(page_num))
+            keys, children = self.read_internal(self.pager.get_page(page_num))
             page_num = children[bisect_left(keys, key)]
         return page_num
 
-    def find(self, key):
-        """Return the row bytes stored under key, or None."""
+    def find(self, key: bytes):
         cells, _ = self.read_leaf(self.pager.get_page(self._find_leaf(key)))
         i = bisect_left([k for k, _ in cells], key)
         if i < len(cells) and cells[i][0] == key:
             return cells[i][1]
         return None
 
-    def scan(self, lo=0, hi=2**32 - 1):
-        """Yield row bytes for lo <= key <= hi, in key order, by walking linked leaves."""
+    def scan(self, lo: bytes = None, hi: bytes = None):
+        """Yield (key, value) for lo <= key <= hi in order (None = unbounded)."""
+        lo = lo if lo is not None else bytes(self.key_size)
         page_num = self._find_leaf(lo)
         while page_num:
             cells, next_leaf = self.read_leaf(self.pager.get_page(page_num))
-            for key, row_bytes in cells:
-                if key > hi:
+            for key, value in cells:
+                if hi is not None and key > hi:
                     return
                 if key >= lo:
-                    yield row_bytes
+                    yield key, value
             page_num = next_leaf
 
     # ---------- insert ----------
-    def insert(self, key, row_bytes):
-        split = self._insert(self.root, key, row_bytes)
-        if split:                       # the root split: tree grows one level
+    def insert(self, key: bytes, value: bytes):
+        assert len(key) == self.key_size and len(value) == self.value_size
+        split = self._insert(self.root, key, value)
+        if split:
             sep_key, new_page = split
             new_root = self.pager.allocate_page()
             root_page = self.pager.get_page(new_root)
-            write_internal(root_page, [sep_key], [self.root, new_page])
+            self.write_internal(root_page, [sep_key], [self.root, new_page])
             self.pager.mark_dirty(new_root, root_page)
             self.root = new_root
 
-    def _insert(self, page_num, key, row_bytes):
-        """Returns None, or (sep_key, new_page) if this node split."""
+    def _insert(self, page_num, key, value):
         page = self.pager.get_page(page_num)
 
         if read_header(page)[0] == LEAF:
@@ -139,42 +136,39 @@ class BTree:
             keys = [k for k, _ in cells]
             i = bisect_left(keys, key)
             if i < len(keys) and keys[i] == key:
-                raise DuplicateKey(f"Duplicate key {key}.")
-            cells.insert(i, (key, row_bytes))
+                raise DuplicateKey("Duplicate key.")
+            cells.insert(i, (key, value))
             if len(cells) <= self.leaf_max:
                 self.write_leaf(page, cells, next_leaf)
                 self.pager.mark_dirty(page_num, page)
                 return None
-            # LEAF SPLIT: left half stays, right half moves to a new page
             mid = len(cells) // 2
             new_page = self.pager.allocate_page()
             right = self.pager.get_page(new_page)
             self.write_leaf(right, cells[mid:], next_leaf)
             self.pager.mark_dirty(new_page, right)
-            self.write_leaf(page, cells[:mid], new_page)       # left -> new -> old next
+            self.write_leaf(page, cells[:mid], new_page)
             self.pager.mark_dirty(page_num, page)
             return cells[mid - 1][0], new_page
 
-        # INTERNAL: go down into the right child, then absorb its split
-        keys, children = read_internal(page)
+        keys, children = self.read_internal(page)
         i = bisect_left(keys, key)
-        split = self._insert(children[i], key, row_bytes)
+        split = self._insert(children[i], key, value)
         if not split:
             return None
         sep_key, new_child = split
         keys.insert(i, sep_key)
         children.insert(i + 1, new_child)
         if len(keys) <= self.internal_max:
-            write_internal(page, keys, children)
+            self.write_internal(page, keys, children)
             self.pager.mark_dirty(page_num, page)
             return None
-        # INTERNAL SPLIT: the middle key moves UP (kept in neither half)
         mid = len(keys) // 2
         new_page = self.pager.allocate_page()
         right = self.pager.get_page(new_page)
-        write_internal(right, keys[mid + 1:], children[mid + 1:])
+        self.write_internal(right, keys[mid + 1:], children[mid + 1:])
         self.pager.mark_dirty(new_page, right)
-        write_internal(page, keys[:mid], children[:mid + 1])
+        self.write_internal(page, keys[:mid], children[:mid + 1])
         self.pager.mark_dirty(page_num, page)
         return keys[mid], new_page
 
@@ -182,26 +176,25 @@ class BTree:
     def depth(self):
         d, page_num = 1, self.root
         while self._node_type(page_num) == INTERNAL:
-            page_num = read_internal(self.pager.get_page(page_num))[1][0]
+            page_num = self.read_internal(self.pager.get_page(page_num))[1][0]
             d += 1
         return d
 
-    def print_tree(self, max_lines=60):
+    def print_tree(self, fmt=lambda k: k.hex(), max_lines=60):
         lines = []
-        self._print(self.root, 0, lines)
+        self._print(self.root, 0, lines, fmt)
         if len(lines) > max_lines:
             lines = lines[:max_lines] + [f"... ({len(lines) - max_lines} more lines)"]
         return "\n".join(lines)
 
-    def _print(self, page_num, indent, lines):
+    def _print(self, page_num, indent, lines, fmt):
         page = self.pager.get_page(page_num)
         pad = "  " * indent
         if read_header(page)[0] == LEAF:
             cells, nxt = self.read_leaf(page)
-            keys = [k for k, _ in cells]
-            lines.append(f"{pad}- leaf p{page_num} ({len(keys)} keys): {keys} -> p{nxt}")
+            lines.append(f"{pad}- leaf p{page_num} ({len(cells)} keys): {[fmt(k) for k, _ in cells]} -> p{nxt}")
         else:
-            keys, children = read_internal(page)
-            lines.append(f"{pad}- internal p{page_num} ({len(keys)} keys): {keys}")
+            keys, children = self.read_internal(page)
+            lines.append(f"{pad}- internal p{page_num} ({len(keys)} keys): {[fmt(k) for k in keys]}")
             for c in children:
-                self._print(c, indent + 1, lines)
+                self._print(c, indent + 1, lines, fmt)

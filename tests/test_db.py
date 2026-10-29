@@ -160,3 +160,109 @@ def test_repl_end_to_end(path):
     assert "needs true/false" in execute(state, "insert 2 bo hi maybe")
     assert execute(state, "find 1") == "(1, 'Ana Silva', NULL, true)"
     assert "vip:bool" in meta(state, ".schema")
+
+
+# ---------- Milestone 6: secondary indexes ----------
+from pydb.schema import Column
+from pydb.keys import encode_value
+
+
+def test_key_encoding_preserves_order():
+    rnd = random.Random(3)
+    ints = [rnd.randint(-2**63, 2**63 - 1) for _ in range(500)] + [-1, 0, 1]
+    floats = [rnd.uniform(-1e9, 1e9) for _ in range(500)] + [-0.5, 0.0, 0.5, -1e-300, 1e-300]
+    texts = ["", "a", "ab", "abc", "b", "Z", "zz", "é"] + [f"user{i}" for i in range(50)]
+    for col, vals in [(Column("x", "int", 8), ints),
+                      (Column("x", "float", 8), floats),
+                      (Column("x", "text", 8), texts),
+                      (Column("x", "bool", 1), [True, False])]:
+        by_bytes = sorted(vals, key=lambda v: encode_value(col, v))
+        assert by_bytes == sorted(vals, key=lambda v: v.encode() if isinstance(v, str) else v)
+
+
+PEOPLE = Schema.parse(["id:int", "name:text(16)", "city:text(16)?", "age:int?", "score:float", "vip:bool"])
+CITIES = ["Austin", "Boston", "Chicago", "Denver", None]
+
+
+def person(i, rnd):
+    return (i, f"p{i}", rnd.choice(CITIES), rnd.choice([None, *range(18, 30)]),
+            round(rnd.uniform(-100, 100), 1), rnd.random() < 0.3)
+
+
+def test_index_matches_full_scan(path):
+    rnd = random.Random(11)
+    t = Table.create(path, PEOPLE)
+    ids = rnd.sample(range(100_000), 3_000)
+    for i in ids[:1_500]:
+        t.insert(person(i, rnd))
+    for col in ("city", "age", "score", "vip"):
+        t.create_index(col)                        # back-fills the first 1,500 rows
+    for i in ids[1_500:]:
+        t.insert(person(i, rnd))                   # later rows go through insert()
+
+    rows = list(t.select_all())
+    for col in ("city", "age", "vip"):
+        pos = PEOPLE.position(col)
+        for value in {r[pos] for r in rows}:
+            expected = sorted(r[0] for r in rows if r[pos] == value)
+            got = t.find_by(col, value)
+            assert t.last_lookup == f"index on {col}"
+            assert sorted(r[0] for r in got) == expected
+
+
+def test_index_survives_reopen(path):
+    t = Table.create(path, PEOPLE)
+    rnd = random.Random(5)
+    for i in range(500):
+        t.insert(person(i, rnd))
+    t.create_index("city")
+    t.close()
+    t2 = Table.open(path)
+    assert "city" in t2.indexes
+    boston = t2.find_by("city", "Boston")
+    assert t2.last_lookup == "index on city"
+    assert boston and all(r[2] == "Boston" for r in boston)
+    t2.insert((10_000, "new", "Boston", 20, 1.0, False))          # index kept in sync after reopen
+    assert 10_000 in [r[0] for r in t2.find_by("city", "Boston")]
+
+
+def test_unindexed_column_uses_full_scan(path):
+    t = Table.create(path, PEOPLE)
+    t.insert((1, "a", "Austin", 20, 1.0, True))
+    assert t.find_by("name", "a")[0][0] == 1
+    assert t.last_lookup == "full scan"
+
+
+def test_index_errors(path):
+    t = Table.create(path, PEOPLE)
+    with pytest.raises(SchemaError):
+        t.create_index("id")                       # primary key
+    with pytest.raises(SchemaError):
+        t.create_index("nope")                     # unknown column
+    t.create_index("city")
+    with pytest.raises(SchemaError):
+        t.create_index("city")                     # already exists
+
+
+def test_duplicate_primary_key_does_not_touch_indexes(path):
+    t = Table.create(path, PEOPLE)
+    t.create_index("city")
+    t.insert((1, "a", "Austin", 20, 1.0, True))
+    with pytest.raises(DuplicateKey):
+        t.insert((1, "b", "Boston", 21, 2.0, False))
+    assert t.find_by("city", "Boston") == []
+
+
+@pytest.mark.parametrize("cache_pages", [1, 3])
+def test_indexes_with_tiny_cache(path, cache_pages):
+    rnd = random.Random(9)
+    t = Table.create(path, PEOPLE, cache_pages)
+    t.create_index("city")
+    t.create_index("age")
+    rows = [person(i, rnd) for i in rnd.sample(range(100_000), 2_000)]
+    for r in rows:
+        t.insert(r)
+    t.close()
+    t2 = Table.open(path, cache_pages)
+    expected = sorted(r[0] for r in rows if r[3] == 21)
+    assert sorted(r[0] for r in t2.find_by("age", 21)) == expected
