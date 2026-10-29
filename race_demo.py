@@ -13,8 +13,9 @@ THREADS, PER_THREAD = 8, 400
 
 def run(locking: bool):
     path = f"race_{'on' if locking else 'off'}.db"
-    if os.path.exists(path):
-        os.remove(path)
+    for f in (path, path + "-wal"):
+        if os.path.exists(f):
+            os.remove(f)
     t = Table.create(path, SCHEMA, cache_pages=16, locking=locking)
     t.create_index("city")
 
@@ -45,7 +46,8 @@ def run(locking: bool):
     print(f"  seen by select       {scanned:>5} / {expected}")
     print(f"  entries in index     {in_index:>5} / {expected}\n")
     t.close()
-    os.remove(path)
+    for f in (path, path + "-wal"):
+        os.remove(f)
 
 
 sys.setswitchinterval(1e-5)     # make threads switch very often, so races show up quickly

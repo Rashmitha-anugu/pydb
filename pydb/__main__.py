@@ -1,7 +1,7 @@
 import os
 import shlex
 import sys
-from .table import Table
+from .table import Table, TransactionError
 from .schema import Schema, SchemaError
 from .btree import DuplicateKey
 
@@ -13,10 +13,11 @@ HELP = """Commands:
   find <id>                  one row by primary key
   find <column> <value>      rows where column = value (null for IS NULL); uses an index if one exists
   index <column>             build a secondary index on a column
+  begin / commit / rollback  group several changes: all of them happen, or none do
   select                     all rows, sorted by key
   select <id>                one row
   select <from> <to>         rows with key between from and to
-  .schema  .indexes  .stats  .btree  .help  .exit"""
+  .schema  .indexes  .stats  .wal  .btree  .help  .exit"""
 
 
 def execute(state: dict, line: str) -> str:
@@ -42,6 +43,14 @@ def execute(state: dict, line: str) -> str:
 
     if table is None:
         return "No table yet. Define one first, e.g.:  create id:int name:text(32) email:text(255)?"
+
+    if cmd in ("begin", "commit", "rollback"):
+        try:
+            getattr(table, cmd)()
+        except TransactionError as e:
+            return f"Error: {e}"
+        return {"begin": "Transaction started.", "commit": "Committed.",
+                "rollback": "Rolled back."}[cmd]
 
     if cmd == "insert":
         try:
@@ -110,6 +119,13 @@ def meta(state: dict, line: str) -> str:
             return "No secondary indexes. Create one with: index <column>"
         return "\n".join(f"{n}: {t.depth()} levels, root p{t.root}, {t.leaf_max} entries per leaf"
                          for n, t in table.indexes.items())
+    if line == ".wal":
+        p = table.pager
+        size = os.path.getsize(p.wal.path)
+        return (f"log: {p.wal.path}, {size:,} bytes, {p.wal.frames} page frames since last checkpoint\n"
+                f"commits={p.commits} checkpoints={p.checkpoints} "
+                f"recovered_on_open={p.recovered_transactions} "
+                f"open_transaction={'yes' if table._in_txn() else 'no'}")
     if line == ".btree":
         return table.tree.print_tree(fmt=lambda k: int.from_bytes(k, "big"))
     return f"Unrecognized command '{line}'. Type .help"
@@ -126,6 +142,9 @@ def main():
     if os.path.exists(path) and os.path.getsize(path) > 0:
         state["table"] = Table.open(path, cache_pages)
         print(f"Opened {path}: {state['table'].schema}")
+        if state["table"].pager.recovered_transactions:
+            print(f"Crash recovery: replayed {state['table'].pager.recovered_transactions} "
+                  f"committed transaction(s) from the log.")
     else:
         print(f"New database {path}. Define a table first (type .help for an example).")
 
@@ -142,6 +161,8 @@ def main():
                 print(out)
     finally:
         if state["table"] is not None:
+            if state["table"]._in_txn():
+                print("Open transaction rolled back (it was never committed).")
             state["table"].close()
 
 

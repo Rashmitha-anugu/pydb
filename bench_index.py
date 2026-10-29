@@ -12,8 +12,9 @@ if os.path.exists(PATH):
 rnd = random.Random(1)
 ids = rnd.sample(range(10_000_000), N_ROWS)
 t = Table.create(PATH, SCHEMA, cache_pages=4096)
-for i in ids:
-    t.insert((i, f"user{i}@example.com", rnd.randint(18, 80), rnd.choice(CITIES)))
+with t.transaction():                      # one commit for the whole load
+    for i in ids:
+        t.insert((i, f"user{i}@example.com", rnd.randint(18, 80), rnd.choice(CITIES)))
 emails = [f"user{i}@example.com" for i in random.Random(2).choices(ids, k=N_LOOKUPS)]
 
 

@@ -11,8 +11,9 @@ if os.path.exists(PATH):
 ids = random.Random(1).sample(range(10_000_000), N_ROWS)
 t = Table.create(PATH, SCHEMA, cache_pages=100_000)
 start = time.perf_counter()
-for i in ids:
-    t.insert((i, f"user{i}", f"u{i}@x.com"))
+with t.transaction():                      # one commit for the whole load
+    for i in ids:
+        t.insert((i, f"user{i}", f"u{i}@x.com"))
 t.close()
 print(f"Inserted {N_ROWS:,} rows in {time.perf_counter() - start:.1f}s "
       f"({os.path.getsize(PATH) // 4096:,} pages, {os.path.getsize(PATH) / 1e6:.1f} MB)\n")

@@ -99,8 +99,9 @@ def test_select_sorted_and_duplicates_rejected(path):
 def test_many_random_inserts_survive_reopen(path):
     ids = random.Random(42).sample(range(1_000_000), 20_000)
     t = Table.create(path, USERS)
-    for i in ids:
-        t.insert(user(i))
+    with t.transaction():
+        for i in ids:
+            t.insert(user(i))
     t.close()
     t2 = Table.open(path)
     assert t2.num_rows == 20_000
@@ -112,8 +113,9 @@ def test_many_random_inserts_survive_reopen(path):
 
 def test_range_scan(path):
     t = Table.create(path, USERS)
-    for i in range(0, 1000, 2):
-        t.insert(user(i))
+    with t.transaction():
+        for i in range(0, 1000, 2):
+            t.insert(user(i))
     assert [r[0] for r in t.select_range(101, 111)] == [102, 104, 106, 108, 110]
 
 
@@ -122,9 +124,11 @@ def test_range_scan(path):
 def test_tiny_cache_never_loses_data(path, cache_pages):
     ids = random.Random(7).sample(range(1_000_000), 5_000)
     t = Table.create(path, USERS, cache_pages)
-    for i in ids:
-        t.insert(user(i))
-    assert len(t.pager._cache) <= cache_pages
+    for start in range(0, len(ids), 250):            # commit every 250 rows
+        with t.transaction():
+            for i in ids[start:start + 250]:
+                t.insert(user(i))
+    assert len(t.pager._cache) <= cache_pages        # dirty pages are evicted only after commit
     t.close()
     t2 = Table.open(path, cache_pages)
     assert [r[0] for r in t2.select_all()] == sorted(ids)
@@ -135,8 +139,9 @@ def test_tiny_cache_never_loses_data(path, cache_pages):
 def test_bigger_cache_means_higher_hit_rate(path):
     ids = random.Random(1).sample(range(1_000_000), 10_000)
     t = Table.create(path, USERS, 4096)
-    for i in ids:
-        t.insert(user(i))
+    with t.transaction():
+        for i in ids:
+            t.insert(user(i))
     t.close()
     lookups = random.Random(2).choices(ids, k=3_000)
     rates = {}
@@ -193,12 +198,14 @@ def test_index_matches_full_scan(path):
     rnd = random.Random(11)
     t = Table.create(path, PEOPLE)
     ids = rnd.sample(range(100_000), 3_000)
-    for i in ids[:1_500]:
-        t.insert(person(i, rnd))
+    with t.transaction():
+        for i in ids[:1_500]:
+            t.insert(person(i, rnd))
     for col in ("city", "age", "score", "vip"):
         t.create_index(col)                        # back-fills the first 1,500 rows
-    for i in ids[1_500:]:
-        t.insert(person(i, rnd))                   # later rows go through insert()
+    with t.transaction():
+        for i in ids[1_500:]:
+            t.insert(person(i, rnd))               # later rows go through insert()
 
     rows = list(t.select_all())
     for col in ("city", "age", "vip"):
@@ -213,8 +220,9 @@ def test_index_matches_full_scan(path):
 def test_index_survives_reopen(path):
     t = Table.create(path, PEOPLE)
     rnd = random.Random(5)
-    for i in range(500):
-        t.insert(person(i, rnd))
+    with t.transaction():
+        for i in range(500):
+            t.insert(person(i, rnd))
     t.create_index("city")
     t.close()
     t2 = Table.open(path)
@@ -260,8 +268,10 @@ def test_indexes_with_tiny_cache(path, cache_pages):
     t.create_index("city")
     t.create_index("age")
     rows = [person(i, rnd) for i in rnd.sample(range(100_000), 2_000)]
-    for r in rows:
-        t.insert(r)
+    for start in range(0, len(rows), 200):
+        with t.transaction():
+            for r in rows[start:start + 200]:
+                t.insert(r)
     t.close()
     t2 = Table.open(path, cache_pages)
     expected = sorted(r[0] for r in rows if r[3] == 21)
@@ -363,3 +373,145 @@ def test_concurrent_inserts_and_reads_lose_nothing(path):
     t.close()
     t2 = Table.open(path)
     assert len(t2.select_all()) == expected
+
+
+# ---------- Milestone 8: write-ahead log, transactions, crash recovery ----------
+import os
+import subprocess
+from pydb.table import TransactionError
+
+SIMPLE = Schema.parse(["id:int", "name:text(16)", "city:text(16)?"])
+
+
+def check_consistent(t):
+    """Every structure agrees: counter, leaf chain, point lookups, index."""
+    rows = t.select_all()
+    assert len(rows) == t.num_rows
+    assert [r[0] for r in rows] == sorted(r[0] for r in rows)
+    for r in rows:
+        assert t.find(r[0]) == r
+    if "city" in t.indexes:
+        assert sum(len(t.find_by("city", c)) for c in ("A", "B", "C", None)) == t.num_rows
+    return {r[0] for r in rows}
+
+
+def test_transaction_commit_and_rollback(path):
+    t = Table.create(path, SIMPLE)
+    t.create_index("city")
+    with t.transaction():
+        t.insert((1, "a", "A"))
+        t.insert((2, "b", "B"))
+    t.begin()
+    t.insert((3, "c", "C"))
+    t.insert((4, "d", "A"))
+    t.rollback()                                       # 3 and 4 never happened
+    assert check_consistent(t) == {1, 2}
+    t.close()
+    assert check_consistent(Table.open(path)) == {1, 2}
+
+
+def test_failed_statement_inside_transaction_rolls_back_everything(path):
+    t = Table.create(path, SIMPLE)
+    t.insert((1, "a", "A"))
+    with pytest.raises(DuplicateKey):
+        with t.transaction():
+            for i in range(2, 200):                    # enough rows to cause splits
+                t.insert((i, f"n{i}", "B"))
+            t.insert((1, "dup", "C"))                  # fails -> whole transaction undone
+    assert check_consistent(t) == {1}
+    assert t.tree.depth() == 1                         # the splits were undone too
+
+
+def test_unclosed_transaction_is_discarded_on_close(path):
+    t = Table.create(path, SIMPLE)
+    t.insert((1, "a", "A"))
+    t.begin()
+    t.insert((2, "b", "B"))
+    t.close()
+    assert check_consistent(Table.open(path)) == {1}
+
+
+def test_transaction_misuse(path):
+    t = Table.create(path, SIMPLE)
+    with pytest.raises(TransactionError):
+        t.commit()
+    t.begin()
+    with pytest.raises(TransactionError):
+        t.begin()
+    t.rollback()
+
+
+CRASH_CHILD = r"""
+import os, sys
+sys.path.insert(0, {root!r})
+from pydb.table import Table
+from pydb.schema import Schema
+path, point, n = sys.argv[1], sys.argv[2], int(sys.argv[3])
+t = Table.create(path, Schema.parse(["id:int", "name:text(16)", "city:text(16)?"]), cache_pages=8)
+t.create_index("city")
+for i in range(n):                                  # n committed rows (enough for splits)
+    t.insert((i, f"n{{i}}", "ABC"[i % 3]))
+def crash(p):
+    if p == point:
+        os._exit(1)                                 # the process dies instantly: no cleanup at all
+t.pager.wal.crash_hook = crash
+t.insert((n, "last", "A"))                          # dies part-way through this insert
+"""
+
+
+@pytest.mark.parametrize("point, last_row_survives", [
+    ("wal_frames_written", False),   # log has the pages but no commit record -> discarded
+    ("wal_committed", True),         # committed in the log, database file untouched -> replayed
+    ("data_page_written", True),     # database file half-updated -> log replays the rest
+])
+def test_crash_at_each_point_recovers(path, point, last_row_survives):
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    n = 300
+    proc = subprocess.run([sys.executable, "-c", CRASH_CHILD.format(root=root), path, point, str(n)])
+    assert proc.returncode == 1                        # it really crashed
+    t = Table.open(path)
+    expected = set(range(n)) | ({n} if last_row_survives else set())
+    assert check_consistent(t) == expected
+    assert os.path.getsize(path + "-wal") == 0         # recovery folded the log into the file
+
+
+KILL_CHILD = r"""
+import sys
+sys.path.insert(0, {root!r})
+from pydb.table import Table
+from pydb.schema import Schema
+path, start = sys.argv[1], int(sys.argv[2])
+schema = Schema.parse(["id:int", "name:text(16)", "city:text(16)?"])
+import os
+if os.path.exists(path) and os.path.getsize(path):
+    t = Table.open(path, cache_pages=8)
+else:
+    t = Table.create(path, schema, cache_pages=8)
+    t.create_index("city")
+i = start
+while True:
+    t.insert((i, f"n{{i}}", "ABC"[i % 3]))
+    print(i, flush=True)                            # printed => committed
+    i += 1
+"""
+
+
+def test_random_kills_never_lose_committed_rows(path):
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    rnd = random.Random(4)
+    confirmed, next_id = set(), 0
+    for round_ in range(8):
+        proc = subprocess.Popen([sys.executable, "-c", KILL_CHILD.format(root=root), path, str(next_id)],
+                                stdout=subprocess.PIPE, text=True)
+        time.sleep(rnd.uniform(0.3, 1.0))
+        proc.kill()                                    # like pulling the plug on the process
+        out, _ = proc.communicate()
+        confirmed |= {int(x) for x in out.split()}
+        t = Table.open(path)
+        survived = check_consistent(t)                 # never corrupted
+        assert confirmed <= survived                   # nothing committed is ever lost
+        assert len(survived - confirmed) <= 1          # at most the row in flight at the kill
+        next_id = max(survived) + 1 if survived else 0
+        confirmed = survived
+        t.close()
+    assert len(confirmed) > 0
