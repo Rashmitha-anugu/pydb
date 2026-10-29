@@ -1,6 +1,7 @@
 import sys
-from .table import Table, TableFull
+from .table import Table
 from .row import Row
+from .btree import DuplicateKey
 
 
 def execute(table: Table, line: str) -> str:
@@ -15,12 +16,25 @@ def execute(table: Table, line: str) -> str:
         try:
             table.insert(Row(int(parts[1]), parts[2], parts[3]))
             return "Executed."
-        except (ValueError, TableFull) as e:
+        except (ValueError, DuplicateKey) as e:
             return f"Error: {e}"
 
+    if cmd == "find":
+        if len(parts) != 2 or not parts[1].isdigit():
+            return "Syntax error. Usage: find <id>"
+        row = table.find(int(parts[1]))
+        return str(row) if row else "Not found."
+
     if cmd == "select":
-        rows = [str(r) for r in table.select_all()]
-        return "\n".join(rows + ["Executed."])
+        if len(parts) == 1:
+            rows = table.select_all()
+        elif len(parts) == 2 and parts[1].isdigit():
+            rows = table.select_range(int(parts[1]), int(parts[1]))
+        elif len(parts) == 3 and parts[1].isdigit() and parts[2].isdigit():
+            rows = table.select_range(int(parts[1]), int(parts[2]))
+        else:
+            return "Syntax error. Usage: select  |  select <id>  |  select <from_id> <to_id>"
+        return "\n".join([str(r) for r in rows] + ["Executed."])
 
     return f"Unrecognized command '{parts[0]}'."
 
@@ -41,14 +55,17 @@ def main():
                 break
             if line == ".stats":
                 p = table.pager
-                print(f"rows={table.num_rows} pages={p.num_pages} "
+                print(f"rows={table.num_rows} pages={p.num_pages} tree_depth={table.tree.depth()} "
                       f"disk_reads={p.reads} disk_writes={p.writes}")
+                continue
+            if line == ".btree":
+                print(table.tree.print_tree())
                 continue
             out = execute(table, line)
             if out:
                 print(out)
     finally:
-        table.close()   # always flush to disk, even on Ctrl+C
+        table.close()
 
 
 if __name__ == "__main__":

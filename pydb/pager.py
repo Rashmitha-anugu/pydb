@@ -1,7 +1,6 @@
 import os
 
 PAGE_SIZE = 4096
-MAX_PAGES = 100  # temporary cap; the B+Tree milestone removes it
 
 
 class PagerError(Exception):
@@ -23,8 +22,8 @@ class Pager:
         self.writes = 0  # disk page writes
 
     def get_page(self, page_num: int) -> bytearray:
-        if not 0 <= page_num < MAX_PAGES:
-            raise PagerError(f"Page {page_num} out of bounds (max {MAX_PAGES}).")
+        if page_num < 0:
+            raise PagerError(f"Invalid page number {page_num}.")
         page = self._cache.get(page_num)
         if page is None:
             if page_num < self.num_pages:
@@ -36,6 +35,12 @@ class Pager:
                 self.num_pages = page_num + 1
             self._cache[page_num] = page
         return page
+
+    def allocate_page(self) -> int:
+        """Hand out the next unused page number (the end of the file)."""
+        page_num = self.num_pages
+        self.get_page(page_num)   # creates a blank page and bumps num_pages
+        return page_num
 
     def mark_dirty(self, page_num: int) -> None:
         self._dirty.add(page_num)

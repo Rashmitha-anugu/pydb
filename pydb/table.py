@@ -1,53 +1,46 @@
 import struct
-from .pager import Pager, PAGE_SIZE, MAX_PAGES
-from .row import Row, ROW_SIZE
+from .pager import Pager
+from .row import Row
+from .btree import BTree, DuplicateKey
 
-HEADER = struct.Struct("<4sHI")             # magic, version, num_rows
-MAGIC, VERSION = b"PYDB", 1
-ROWS_PER_PAGE = PAGE_SIZE // ROW_SIZE        # 14
-MAX_ROWS = ROWS_PER_PAGE * (MAX_PAGES - 1)   # page 0 is the header
-
-
-class TableFull(Exception):
-    pass
+# Page 0 header: magic | version | root page | num_rows
+HEADER = struct.Struct("<4sHII")
+MAGIC, VERSION = b"PYDB", 2
 
 
 class Table:
     def __init__(self, path: str):
         self.pager = Pager(path)
-        header = self.pager.get_page(0)
-        if self.pager.num_pages == 1 and header[:4] == b"\0\0\0\0":   # brand-new file
+        if self.pager.num_pages == 0:                      # brand-new file
+            self.pager.allocate_page()                     # page 0 = header
+            self.tree = BTree.create(self.pager)           # page 1 = empty root leaf
             self.num_rows = 0
             self._write_header()
         else:
-            magic, version, self.num_rows = HEADER.unpack_from(header)
+            magic, version, root, self.num_rows = HEADER.unpack_from(self.pager.get_page(0))
             if magic != MAGIC:
                 raise ValueError("Not a pydb file.")
+            if version != VERSION:
+                raise ValueError(f"File is format v{version}, this code reads v{VERSION}. Delete it and recreate.")
+            self.tree = BTree(self.pager, root)
 
     def _write_header(self):
-        HEADER.pack_into(self.pager.get_page(0), 0, MAGIC, VERSION, self.num_rows)
+        HEADER.pack_into(self.pager.get_page(0), 0, MAGIC, VERSION, self.tree.root, self.num_rows)
         self.pager.mark_dirty(0)
 
-    def _slot(self, row_num: int):
-        page_num = 1 + row_num // ROWS_PER_PAGE
-        offset = (row_num % ROWS_PER_PAGE) * ROW_SIZE
-        return page_num, offset
-
     def insert(self, row: Row) -> None:
-        if self.num_rows >= MAX_ROWS:
-            raise TableFull("Table full.")
-        data = row.serialize()
-        page_num, offset = self._slot(self.num_rows)
-        page = self.pager.get_page(page_num)
-        page[offset:offset + ROW_SIZE] = data
-        self.pager.mark_dirty(page_num)
+        self.tree.insert(row.id, row.serialize())   # raises DuplicateKey on repeats
         self.num_rows += 1
-        self._write_header()
+        self._write_header()                        # root may have changed after a split
+
+    def find(self, row_id: int):
+        return self.tree.find(row_id)
 
     def select_all(self):
-        for i in range(self.num_rows):
-            page_num, offset = self._slot(i)
-            yield Row.deserialize(memoryview(self.pager.get_page(page_num))[offset:])
+        return self.tree.scan()
+
+    def select_range(self, lo: int, hi: int):
+        return self.tree.scan(lo, hi)
 
     def close(self):
         self.pager.close()
