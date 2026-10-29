@@ -10,7 +10,7 @@ from .keys import PK_SIZE, pk_key, pk_from_key, index_key, index_key_size, index
 from .rwlock import RWLock, NoLock
 
 # Page 0 header: magic | version | main-tree root | num_rows | meta length | meta (JSON)
-# meta = {"columns": [...], "indexes": {"email": <root page>, ...}}
+# meta = {"name": "users", "columns": [...], "indexes": {"email": <root page>, ...}}
 HEADER = struct.Struct("<4sHIIH")
 MAGIC, VERSION = b"PYDB", 4
 
@@ -45,13 +45,14 @@ class Table:
 
     # ---------- open / create ----------
     @classmethod
-    def create(cls, path: str, schema: Schema, cache_pages: int = 64, locking: bool = True) -> "Table":
+    def create(cls, path: str, schema: Schema, cache_pages: int = 64, locking: bool = True,
+               name: str = "t") -> "Table":
         if os.path.exists(path) and os.path.getsize(path) > 0:
             raise FileExistsError(f"{path} already exists.")
         pager = Pager(path, cache_pages)
         pager.allocate_page()                                       # page 0 = header
         tree = BTree.create(pager, PK_SIZE, schema.row_size)        # page 1 = root leaf
-        cls._write_meta(pager, schema, tree.root, 0, {})
+        cls._write_meta(pager, schema, tree.root, 0, {}, name)
         pager.commit()
         return cls(pager, locking)
 
@@ -70,14 +71,16 @@ class Table:
             raise ValueError(f"File is format v{version}, this code reads v{VERSION}. Delete it and recreate.")
         meta = json.loads(bytes(page[HEADER.size:HEADER.size + meta_len]))
         self.schema = Schema.from_json(json.dumps(meta["columns"]).encode())
+        self.name = meta.get("name", "t")
         self.tree = BTree(self.pager, root, PK_SIZE, self.schema.row_size)
         self.num_rows = num_rows
         self.indexes = {name: BTree(self.pager, iroot, index_key_size(self.schema.column(name)), 0)
                         for name, iroot in meta["indexes"].items()}
 
     @staticmethod
-    def _write_meta(pager, schema, root, num_rows, indexes):
-        meta = json.dumps({"columns": json.loads(schema.to_json()), "indexes": indexes}).encode()
+    def _write_meta(pager, schema, root, num_rows, indexes, name):
+        meta = json.dumps({"name": name, "columns": json.loads(schema.to_json()),
+                           "indexes": indexes}).encode()
         if HEADER.size + len(meta) > PAGE_SIZE:
             raise ValueError("Table metadata no longer fits in the header page.")
         page = pager.get_page(0)
@@ -87,7 +90,7 @@ class Table:
 
     def _save_meta(self):
         self._write_meta(self.pager, self.schema, self.tree.root, self.num_rows,
-                         {n: t.root for n, t in self.indexes.items()})
+                         {n: t.root for n, t in self.indexes.items()}, self.name)
 
     # ---------- locking + transactions ----------
     def _in_txn(self) -> bool:
@@ -158,7 +161,10 @@ class Table:
         with self._writing():
             row_bytes = self.schema.encode(values)             # validate before touching pages
             pk = values[0]
-            self.tree.insert(pk_key(pk), row_bytes)            # DuplicateKey stops here
+            try:
+                self.tree.insert(pk_key(pk), row_bytes)        # DuplicateKey stops here
+            except DuplicateKey:
+                raise DuplicateKey(f"Duplicate primary key {pk}.") from None
             for name, idx in self.indexes.items():             # keep every index in sync
                 col = self.schema.column(name)
                 idx.insert(index_key(col, values[self.schema.position(name)], pk), b"")

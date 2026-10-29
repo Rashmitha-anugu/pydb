@@ -1,134 +1,105 @@
+"""SQL shell:   python -m pydb my.db [cache_pages]
+
+End each statement with ;  (a statement may span several lines).
+Dot-commands (.help, .schema, ...) need no semicolon.
+"""
 import os
-import shlex
+import re
 import sys
-from .table import Table, TransactionError
-from .schema import Schema, SchemaError
+from .sql_exec import Session, format_result
+from .sql_parser import SQLError
+from .schema import SchemaError
 from .btree import DuplicateKey
+from .table import TransactionError
 
-HELP = """Commands:
-  create <col:type> ...      define the table (new database only). Types: int bool float text(N)
-                             add ? for nullable. First column = primary key (int).
-                             e.g.  create id:int name:text(32) email:text(255)? age:int? active:bool
-  insert <v1> <v2> ...       values in column order; use null for NULL, quotes for spaces: 'Ana Silva'
-  find <id>                  one row by primary key
-  find <column> <value>      rows where column = value (null for IS NULL); uses an index if one exists
-  index <column>             build a secondary index on a column
-  begin / commit / rollback  group several changes: all of them happen, or none do
-  select                     all rows, sorted by key
-  select <id>                one row
-  select <from> <to>         rows with key between from and to
-  .schema  .indexes  .stats  .wal  .btree  .help  .exit"""
+HELP = """SQL (end each statement with ;):
+  CREATE TABLE users (id INT PRIMARY KEY, name TEXT(32) NOT NULL, city TEXT(16), age INT, vip BOOL);
+  INSERT INTO users VALUES (1, 'Ana', 'Austin', 31, TRUE), (2, 'Bob', NULL, 25, FALSE);
+  INSERT INTO users (id, name) VALUES (3, 'Chikki');
+  SELECT * FROM users WHERE age >= 25 AND city IS NOT NULL ORDER BY age DESC LIMIT 10;
+  SELECT COUNT(*) FROM users WHERE id BETWEEN 1 AND 100;
+  CREATE INDEX idx_city ON users (city);
+  EXPLAIN SELECT * FROM users WHERE city = 'Austin';
+  BEGIN;  ...  COMMIT;   (or ROLLBACK;)
+Types: INT, FLOAT, BOOL, TEXT(n). The first column is the primary key (INT).
+Columns are nullable unless NOT NULL.
+
+Dot-commands:
+  .schema  .indexes  .stats  .wal  .btree  .read <file.sql>  .help  .exit"""
+
+ERRORS = (SQLError, SchemaError, DuplicateKey, TransactionError, FileExistsError)
 
 
-def execute(state: dict, line: str) -> str:
+def split_statements(buffer: str):
+    """Return (complete statements, leftover text).
+    Semicolons inside 'quotes' or after a -- comment don't end a statement."""
+    stmts, start, in_quote, in_comment = [], 0, False, False
+    for i, ch in enumerate(buffer):
+        if in_comment:
+            in_comment = ch != "\n"
+        elif ch == "'":
+            in_quote = not in_quote              # '' inside a string toggles twice: fine
+        elif not in_quote and buffer.startswith("--", i):
+            in_comment = True
+        elif ch == ";" and not in_quote:
+            stmts.append(buffer[start:i])
+            start = i + 1
+    rest = buffer[start:]
+    if not strip_comments(rest):
+        rest = ""                                  # only comments left over: nothing pending
+    return [s.strip() for s in stmts if strip_comments(s)], rest
+
+
+def strip_comments(text: str) -> str:
+    return re.sub(r"--[^\n]*", "", text).strip()
+
+
+def run_sql(session: Session, sql: str) -> str:
     try:
-        parts = shlex.split(line)
-    except ValueError as e:                     # e.g. an unclosed quote
-        return f"Syntax error: {e}"
-    if not parts:
-        return ""
-    cmd = parts[0].lower()
-    table = state["table"]
-
-    if cmd == "create":
-        if table is not None:
-            return "Error: this database already has a table."
-        try:
-            schema = Schema.parse(parts[1:])
-        except SchemaError as e:
-            return f"Error: {e}"
-        state["table"] = Table.create(state["path"], schema, state["cache_pages"])
-        return f"Created table ({schema}). Row size: {schema.row_size} bytes, " \
-               f"{state['table'].tree.leaf_max} rows per leaf page."
-
-    if table is None:
-        return "No table yet. Define one first, e.g.:  create id:int name:text(32) email:text(255)?"
-
-    if cmd in ("begin", "commit", "rollback"):
-        try:
-            getattr(table, cmd)()
-        except TransactionError as e:
-            return f"Error: {e}"
-        return {"begin": "Transaction started.", "commit": "Committed.",
-                "rollback": "Rolled back."}[cmd]
-
-    if cmd == "insert":
-        try:
-            table.insert(table.schema.parse_values(parts[1:]))
-            return "Executed."
-        except (SchemaError, DuplicateKey) as e:
-            return f"Error: {e}"
-
-    if cmd == "index":
-        if len(parts) != 2:
-            return "Syntax error. Usage: index <column>"
-        try:
-            count = table.create_index(parts[1])
-        except SchemaError as e:
-            return f"Error: {e}"
-        return f"Index on '{parts[1]}' created ({count} rows indexed)."
-
-    if cmd == "find":
-        if len(parts) == 2 and parts[1].isdigit():
-            row = table.find(int(parts[1]))
-            return table.schema.format_row(row) if row else "Not found."
-        if len(parts) == 3:
-            try:
-                col = table.schema.column(parts[1])
-                value = table.schema.parse_value(col, parts[2])
-                before = table.pager.hits + table.pager.misses
-                rows = table.find_by(parts[1], value)
-            except SchemaError as e:
-                return f"Error: {e}"
-            pages = table.pager.hits + table.pager.misses - before
-            lines = [table.schema.format_row(r) for r in rows]
-            lines.append(f"({len(rows)} row(s) via {table.last_lookup}, {pages} pages touched)")
-            return "\n".join(lines)
-        return "Syntax error. Usage: find <id>  |  find <column> <value>"
-
-    if cmd == "select":
-        if len(parts) == 1:
-            rows = table.select_all()
-        elif len(parts) == 2 and parts[1].isdigit():
-            rows = table.select_range(int(parts[1]), int(parts[1]))
-        elif len(parts) == 3 and parts[1].isdigit() and parts[2].isdigit():
-            rows = table.select_range(int(parts[1]), int(parts[2]))
-        else:
-            return "Syntax error. Usage: select  |  select <id>  |  select <from> <to>"
-        return "\n".join([table.schema.format_row(r) for r in rows] + ["Executed."])
-
-    return f"Unrecognized command '{parts[0]}'. Type .help"
+        return format_result(session.execute(sql))
+    except ERRORS as e:
+        return f"Error: {e}"
 
 
-def meta(state: dict, line: str) -> str:
-    table = state["table"]
-    if line == ".help":
+def meta(session: Session, line: str) -> str:
+    cmd, _, arg = line.partition(" ")
+    if cmd == ".help":
         return HELP
-    if table is None:
-        return "No table yet. Type .help"
-    if line == ".schema":
-        return f"{table.schema}\nrow size: {table.schema.row_size} bytes, {table.tree.leaf_max} rows per leaf page"
-    if line == ".stats":
-        p = table.pager
-        return (f"rows={table.num_rows} pages={p.num_pages} tree_depth={table.tree.depth()}\n"
+    if cmd == ".read":
+        try:
+            text = open(arg.strip(), encoding="utf-8").read()
+        except OSError as e:
+            return f"Error: {e}"
+        stmts, rest = split_statements(text)
+        out = [f"> {s}\n{run_sql(session, s)}" for s in stmts]
+        if rest.strip():
+            out.append(f"Error: last statement has no closing semicolon: {rest.strip()[:40]}...")
+        return "\n".join(out)
+    t = session.table
+    if t is None:
+        return "No table yet. Type .help for an example CREATE TABLE."
+    if cmd == ".schema":
+        cols = ", ".join(f"{c.name} {c.type.upper()}{f'({c.size})' if c.type == 'text' else ''}"
+                         f"{' PRIMARY KEY' if i == 0 else ('' if c.nullable else ' NOT NULL')}"
+                         for i, c in enumerate(t.schema.columns))
+        return f"CREATE TABLE {t.name} ({cols});\n-- {t.schema.row_size} bytes per row, {t.tree.leaf_max} rows per page"
+    if cmd == ".indexes":
+        if not t.indexes:
+            return "No secondary indexes. Create one with: CREATE INDEX ON <table> (<column>);"
+        return "\n".join(f"{n}: {ix.depth()} levels, {ix.leaf_max} entries per leaf" for n, ix in t.indexes.items())
+    if cmd == ".stats":
+        p = t.pager
+        return (f"rows={t.num_rows} pages={p.num_pages} tree_depth={t.tree.depth()}\n"
                 f"cache: {len(p._cache)}/{p.capacity} pages, hit_rate={p.hit_rate():.1%} "
-                f"(hits={p.hits} misses={p.misses}) evictions={p.evictions}\n"
-                f"disk: reads={p.reads} writes={p.writes}")
-    if line == ".indexes":
-        if not table.indexes:
-            return "No secondary indexes. Create one with: index <column>"
-        return "\n".join(f"{n}: {t.depth()} levels, root p{t.root}, {t.leaf_max} entries per leaf"
-                         for n, t in table.indexes.items())
-    if line == ".wal":
-        p = table.pager
-        size = os.path.getsize(p.wal.path)
-        return (f"log: {p.wal.path}, {size:,} bytes, {p.wal.frames} page frames since last checkpoint\n"
-                f"commits={p.commits} checkpoints={p.checkpoints} "
-                f"recovered_on_open={p.recovered_transactions} "
-                f"open_transaction={'yes' if table._in_txn() else 'no'}")
-    if line == ".btree":
-        return table.tree.print_tree(fmt=lambda k: int.from_bytes(k, "big"))
-    return f"Unrecognized command '{line}'. Type .help"
+                f"evictions={p.evictions}\ndisk: reads={p.reads} writes={p.writes}")
+    if cmd == ".wal":
+        p = t.pager
+        return (f"log: {p.wal.path}, {os.path.getsize(p.wal.path):,} bytes, {p.wal.frames} frames since checkpoint\n"
+                f"commits={p.commits} checkpoints={p.checkpoints} recovered_on_open={p.recovered_transactions} "
+                f"open_transaction={'yes' if t._in_txn() else 'no'}")
+    if cmd == ".btree":
+        return t.tree.print_tree(fmt=lambda k: int.from_bytes(k, "big"))
+    return f"Unknown command {cmd}. Type .help"
 
 
 def main():
@@ -136,34 +107,34 @@ def main():
         print("Usage: python -m pydb <database-file> [cache_pages]")
         sys.exit(1)
     path = sys.argv[1]
-    cache_pages = int(sys.argv[2]) if len(sys.argv) == 3 else 64
-    state = {"path": path, "cache_pages": cache_pages, "table": None}
-
-    if os.path.exists(path) and os.path.getsize(path) > 0:
-        state["table"] = Table.open(path, cache_pages)
-        print(f"Opened {path}: {state['table'].schema}")
-        if state["table"].pager.recovered_transactions:
-            print(f"Crash recovery: replayed {state['table'].pager.recovered_transactions} "
-                  f"committed transaction(s) from the log.")
+    session = Session(path, int(sys.argv[2]) if len(sys.argv) == 3 else 64)
+    if session.table:
+        print(f"Opened {path}: table {session.table.name} ({session.table.num_rows} rows). Type .help")
+        if session.table.pager.recovered_transactions:
+            print(f"Crash recovery: replayed {session.table.pager.recovered_transactions} committed transaction(s).")
     else:
-        print(f"New database {path}. Define a table first (type .help for an example).")
+        print(f"New database {path}. Start with CREATE TABLE ... ; (type .help for an example)")
 
+    buffer = ""
     try:
         while True:
             try:
-                line = input("db > ").strip()
+                line = input("sql> " if not buffer.strip() else " ...> ")
             except EOFError:
                 break
-            if line == ".exit":
-                break
-            out = meta(state, line) if line.startswith(".") else execute(state, line)
-            if out:
-                print(out)
+            if not buffer.strip() and line.strip().startswith("."):
+                if line.strip() == ".exit":
+                    break
+                print(meta(session, line.strip()))
+                continue
+            buffer += line + "\n"
+            stmts, buffer = split_statements(buffer)
+            for s in stmts:
+                print(run_sql(session, s))
     finally:
-        if state["table"] is not None:
-            if state["table"]._in_txn():
-                print("Open transaction rolled back (it was never committed).")
-            state["table"].close()
+        if session.table is not None and session.table._in_txn():
+            print("Open transaction rolled back (it was never committed).")
+        session.close()
 
 
 if __name__ == "__main__":

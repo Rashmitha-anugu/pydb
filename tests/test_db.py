@@ -154,19 +154,6 @@ def test_bigger_cache_means_higher_hit_rate(path):
     assert rates[4] < rates[64] < rates[1024]
 
 
-# ---------- REPL ----------
-def test_repl_end_to_end(path):
-    from pydb.__main__ import execute, meta
-    state = {"path": path, "cache_pages": 64, "table": None}
-    assert "No table yet" in execute(state, "insert 1 a")
-    assert "Created table" in execute(state, "create id:int name:text(16) note:text(32)? vip:bool")
-    assert execute(state, "insert 1 'Ana Silva' null true") == "Executed."
-    assert "cannot be NULL" in execute(state, "insert 2 null hi false")
-    assert "needs true/false" in execute(state, "insert 2 bo hi maybe")
-    assert execute(state, "find 1") == "(1, 'Ana Silva', NULL, true)"
-    assert "vip:bool" in meta(state, ".schema")
-
-
 # ---------- Milestone 6: secondary indexes ----------
 from pydb.schema import Column
 from pydb.keys import encode_value
@@ -515,3 +502,150 @@ def test_random_kills_never_lose_committed_rows(path):
         confirmed = survived
         t.close()
     assert len(confirmed) > 0
+
+
+# ---------- Milestone 9: SQL ----------
+from pydb.sql_parser import parse, SQLError, Compare, And, Or, Not, IsNull
+from pydb.sql_exec import Session, evaluate
+from pydb.__main__ import split_statements
+
+
+def test_parser_precedence_and_flipping():
+    w = parse("SELECT * FROM t WHERE a = 1 OR b = 2 AND NOT c > 3").where
+    assert isinstance(w, Or) and isinstance(w.right, And) and isinstance(w.right.right, Not)
+    assert parse("SELECT * FROM t WHERE 10 < id").where == Compare("id", ">", 10)
+    assert parse("SELECT * FROM t WHERE x <> -2.5").where == Compare("x", "!=", -2.5)
+    assert parse("INSERT INTO t VALUES (1, 'O''Brien', NULL, TRUE)").rows == [[1, "O'Brien", None, True]]
+
+
+@pytest.mark.parametrize("bad", [
+    "SELEC * FROM t", "SELECT * FROM", "SELECT * FROM t WHERE", "SELECT * FROM t WHERE a >",
+    "CREATE TABLE t (a TEXT)", "CREATE TABLE t (a WEIRD)", "SELECT * FROM t LIMIT 1.5",
+    "SELECT * FROM t WHERE a = @", "INSERT INTO t VALUES (1", "SELECT * FROM t extra",
+])
+def test_parser_errors(bad):
+    with pytest.raises(SQLError):
+        parse(bad)
+
+
+def test_three_valued_logic():
+    row = {"a": None, "b": 1}
+    assert evaluate(Compare("a", "=", 1), row) is None              # NULL = 1  -> unknown
+    assert evaluate(Not(Compare("a", "=", 1)), row) is None         # NOT unknown -> unknown
+    assert evaluate(Or(Compare("a", "=", 1), Compare("b", "=", 1)), row) is True
+    assert evaluate(And(Compare("a", "=", 1), Compare("b", "=", 2)), row) is False
+    assert evaluate(IsNull("a"), row) is True
+
+
+def test_split_statements_ignores_semicolons_in_quotes():
+    stmts, rest = split_statements("INSERT INTO t VALUES (1, 'a;b'); SELECT * FROM t; SELECT")
+    assert stmts == ["INSERT INTO t VALUES (1, 'a;b')", "SELECT * FROM t"]
+    assert rest.strip() == "SELECT"
+
+
+@pytest.fixture
+def db(path):
+    s = Session(path)
+    s.execute("CREATE TABLE users (id INT PRIMARY KEY, name TEXT(16) NOT NULL, "
+              "city TEXT(16), age INT, score FLOAT, vip BOOL)")
+    s.execute("INSERT INTO users VALUES (3, 'Ana', 'Austin', 31, 9.5, TRUE), "
+              "(1, 'Bob', NULL, 31, 7, FALSE), (2, 'Chi', 'Boston', 25, -8.25, TRUE)")
+    s.execute("INSERT INTO users (id, name) VALUES (4, 'Dan')")
+    return s
+
+
+def ids(result):
+    return [r[0] for r in result.rows]
+
+
+def test_select_basics(db):
+    assert ids(db.execute("SELECT * FROM users")) == [1, 2, 3, 4]
+    assert db.execute("SELECT name, age FROM users WHERE id = 3").rows == [("Ana", 31)]
+    assert ids(db.execute("SELECT * FROM users WHERE city IS NULL")) == [1, 4]
+    assert ids(db.execute("SELECT * FROM users WHERE city = NULL")) == []          # never true in SQL
+    assert ids(db.execute("SELECT * FROM users WHERE age > 30 AND vip = TRUE")) == [3]
+    assert ids(db.execute("SELECT * FROM users WHERE id BETWEEN 2 AND 3")) == [2, 3]
+    assert ids(db.execute("SELECT * FROM users ORDER BY age DESC LIMIT 2")) == [1, 3]
+    assert ids(db.execute("SELECT * FROM users ORDER BY age")) == [4, 2, 1, 3]     # NULL sorts first
+    assert db.execute("SELECT COUNT(*) FROM users WHERE score < 8").rows == [(2,)]
+    assert db.execute("SELECT * FROM users WHERE id = 4").rows == [(4, "Dan", None, None, None, None)]
+
+
+def test_explain_picks_the_right_plan(db):
+    explain = lambda q: db.execute("EXPLAIN " + q).message
+    assert "USING PRIMARY KEY (id = 3)" in explain("SELECT * FROM users WHERE id = 3")
+    assert "PRIMARY KEY RANGE" in explain("SELECT * FROM users WHERE id > 1 AND id < 4")
+    assert "SCAN" in explain("SELECT * FROM users WHERE city = 'Austin'")
+    db.execute("CREATE INDEX ON users (city)")
+    assert "USING INDEX ON city" in explain("SELECT * FROM users WHERE city = 'Austin' AND age > 1")
+    assert "USING INDEX ON city" in explain("SELECT * FROM users WHERE city IS NULL")
+    assert "SCAN" in explain("SELECT * FROM users WHERE city = 'Austin' OR age > 1")   # OR can't use it
+    assert "SORT" in explain("SELECT * FROM users ORDER BY age")
+    assert "SORT" not in explain("SELECT * FROM users ORDER BY id")                   # already in id order
+
+
+def test_every_plan_returns_the_same_rows_as_brute_force(path):
+    rnd = random.Random(21)
+    s = Session(path)
+    s.execute("CREATE TABLE p (id INT PRIMARY KEY, city TEXT(8), age INT)")
+    data = {i: (i, rnd.choice(["A", "B", "C", None]), rnd.choice([None, *range(20, 30)]))
+            for i in rnd.sample(range(1, 2000), 400)}
+    s.execute("INSERT INTO p VALUES " + ", ".join(
+        f"({i}, {'NULL' if c is None else repr(c)}, {'NULL' if a is None else a})" for i, c, a in data.values()))
+    queries = []
+    for _ in range(150):
+        lo, hi = sorted(rnd.sample(range(0, 2100), 2))
+        c, a = rnd.choice(["A", "B", "C"]), rnd.randint(18, 32)
+        queries += [(f"id = {lo}", lambda r, lo=lo: r[0] == lo),
+                    (f"id >= {lo} AND id < {hi}", lambda r, lo=lo, hi=hi: lo <= r[0] < hi),
+                    (f"city = '{c}'", lambda r, c=c: r[1] == c),
+                    (f"city = '{c}' AND age >= {a}", lambda r, c=c, a=a: r[1] == c and r[2] is not None and r[2] >= a),
+                    (f"city IS NULL OR age < {a}", lambda r, a=a: r[1] is None or (r[2] is not None and r[2] < a))]
+    for indexed in (False, True):
+        if indexed:
+            s.execute("CREATE INDEX ON p (city)")
+        for where, check in queries:
+            got = ids(s.execute(f"SELECT * FROM p WHERE {where}"))
+            assert got == sorted(i for i, r in data.items() if check(r)), where
+
+
+def test_multi_row_insert_is_atomic(db):
+    with pytest.raises(DuplicateKey):
+        db.execute("INSERT INTO users VALUES (10, 'x', NULL, 1, 1, TRUE), (3, 'dup', NULL, 1, 1, TRUE)")
+    assert db.execute("SELECT COUNT(*) FROM users").rows == [(4,)]                  # row 10 rolled back too
+
+
+def test_sql_transactions(db):
+    db.execute("BEGIN")
+    db.execute("INSERT INTO users (id, name) VALUES (20, 'tmp')")
+    assert ids(db.execute("SELECT * FROM users WHERE id = 20")) == [20]            # visible inside
+    db.execute("ROLLBACK")
+    assert ids(db.execute("SELECT * FROM users WHERE id = 20")) == []
+
+
+@pytest.mark.parametrize("bad, error", [
+    ("SELECT * FROM orders", SQLError),
+    ("SELECT nope FROM users", SchemaError),
+    ("SELECT * FROM users WHERE age = 'x'", SchemaError),
+    ("INSERT INTO users (name) VALUES ('x')", SQLError),
+    ("INSERT INTO users VALUES (9, NULL, NULL, 1, 1, TRUE)", SchemaError),
+    ("INSERT INTO users VALUES (9, 'x')", SQLError),
+    ("CREATE TABLE again (id INT)", SQLError),
+])
+def test_sql_errors(db, bad, error):
+    with pytest.raises(error):
+        db.execute(bad)
+
+
+def test_table_name_and_data_survive_reopen(db, path):
+    db.close()
+    s = Session(path)
+    assert s.table.name == "users"
+    assert ids(s.execute("SELECT * FROM users WHERE age = 31")) == [1, 3]
+
+
+def test_create_table_rules(path, tmp_path):
+    with pytest.raises(SQLError):
+        Session(path).execute("CREATE TABLE t (a TEXT(8), id INT PRIMARY KEY)")      # key not first
+    with pytest.raises(SchemaError):
+        Session(str(tmp_path / "x.db")).execute("CREATE TABLE t (name TEXT(8))")    # key must be INT
