@@ -266,3 +266,100 @@ def test_indexes_with_tiny_cache(path, cache_pages):
     t2 = Table.open(path, cache_pages)
     expected = sorted(r[0] for r in rows if r[3] == 21)
     assert sorted(r[0] for r in t2.find_by("age", 21)) == expected
+
+
+# ---------- Milestone 7: concurrency ----------
+import sys
+import threading
+import time
+from pydb.rwlock import RWLock
+
+
+def test_rwlock_allows_concurrent_readers():
+    lock = RWLock()
+    barrier = threading.Barrier(4, timeout=5)      # only passes if all 4 are inside at once
+    def reader():
+        with lock.read():
+            barrier.wait()
+    ts = [threading.Thread(target=reader) for _ in range(4)]
+    [t.start() for t in ts]
+    [t.join() for t in ts]
+    assert not barrier.broken
+
+
+def test_rwlock_writer_is_exclusive():
+    lock, inside, problems = RWLock(), [0], []
+    def reader():
+        for _ in range(200):
+            with lock.read():
+                if inside[0] < 0:
+                    problems.append("read during write")
+    def writer():
+        for _ in range(200):
+            with lock.write():
+                inside[0] -= 1                     # -1 = a writer is inside
+                if inside[0] != -1:
+                    problems.append("two writers")
+                inside[0] += 1
+    ts = [threading.Thread(target=f) for f in [reader, reader, writer, writer]]
+    [t.start() for t in ts]
+    [t.join() for t in ts]
+    assert problems == []
+
+
+def test_rwlock_waiting_writer_blocks_new_readers():
+    lock, order = RWLock(), []
+    first_reader_in, writer_waiting = threading.Event(), threading.Event()
+    def first_reader():
+        with lock.read():
+            first_reader_in.set()
+            writer_waiting.wait()
+            time.sleep(0.1)                         # writer is queued during this
+            order.append("reader1 done")
+    def writer():
+        first_reader_in.wait()
+        writer_waiting.set()
+        with lock.write():
+            order.append("writer")
+    def late_reader():
+        writer_waiting.wait()
+        time.sleep(0.05)                            # arrives while the writer is queued
+        with lock.read():
+            order.append("reader2")
+    ts = [threading.Thread(target=f) for f in [first_reader, writer, late_reader]]
+    [t.start() for t in ts]
+    [t.join() for t in ts]
+    assert order == ["reader1 done", "writer", "reader2"]   # writer was not starved
+
+
+def test_concurrent_inserts_and_reads_lose_nothing(path):
+    old = sys.getswitchinterval()
+    sys.setswitchinterval(1e-5)                     # switch threads very often to provoke races
+    try:
+        t = Table.create(path, PEOPLE, cache_pages=16)
+        t.create_index("city")
+        errors = []
+        def worker(w):
+            rnd = random.Random(w)
+            try:
+                for k in range(150):
+                    i = w * 10_000 + k
+                    t.insert(person(i, rnd))
+                    if k % 5 == 0:
+                        assert t.find(i)[0] == i
+                        t.find_by("city", "Boston")
+            except Exception as e:
+                errors.append(e)
+        ts = [threading.Thread(target=worker, args=(w,)) for w in range(6)]
+        [x.start() for x in ts]
+        [x.join() for x in ts]
+    finally:
+        sys.setswitchinterval(old)
+    assert errors == []
+    expected = 6 * 150
+    assert t.num_rows == expected
+    assert len(t.select_all()) == expected
+    assert sum(len(t.find_by("city", c)) for c in CITIES) == expected
+    t.close()
+    t2 = Table.open(path)
+    assert len(t2.select_all()) == expected

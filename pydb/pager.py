@@ -1,4 +1,5 @@
 import os
+import threading
 from collections import OrderedDict
 
 PAGE_SIZE = 4096
@@ -10,8 +11,9 @@ class PagerError(Exception):
 
 
 class Pager:
-    """Keeps at most `cache_pages` pages in memory. When full, the least-recently-used
-    page is evicted (written to disk first if it has unsaved changes)."""
+    """Reads/writes fixed-size pages, keeping at most `cache_pages` of them in memory.
+    When the cache is full, the least-recently-used page is evicted (written to disk
+    first if it has unsaved changes)."""
 
     def __init__(self, path: str, cache_pages: int = DEFAULT_CACHE_PAGES):
         if cache_pages < 1:
@@ -26,46 +28,50 @@ class Pager:
         self.num_pages = size // PAGE_SIZE
         self._cache: OrderedDict[int, bytearray] = OrderedDict()   # oldest first
         self._dirty: set[int] = set()
-        self.hits = 0        # page was already in memory
-        self.misses = 0      # page had to be loaded
+        self.hits = 0        # page found in cache
+        self.misses = 0      # page had to be read from disk (or created)
         self.evictions = 0
         self.reads = 0       # disk page reads
         self.writes = 0      # disk page writes
+        self._mutex = threading.RLock()   # RLock: allocate_page() calls get_page()
 
     def get_page(self, page_num: int) -> bytearray:
-        if page_num < 0:
-            raise PagerError(f"Invalid page number {page_num}.")
-        page = self._cache.get(page_num)
-        if page is not None:
-            self.hits += 1
-            self._cache.move_to_end(page_num)          # now the most recently used
+        with self._mutex:
+            if page_num < 0:
+                raise PagerError(f"Invalid page number {page_num}.")
+            page = self._cache.get(page_num)
+            if page is not None:
+                self.hits += 1
+                self._cache.move_to_end(page_num)          # now the most recently used
+                return page
+            self.misses += 1
+            if page_num < self.num_pages:
+                self._file.seek(page_num * PAGE_SIZE)
+                data = self._file.read(PAGE_SIZE)
+                page = bytearray(data.ljust(PAGE_SIZE, b"\0"))   # page may not be on disk yet
+                self.reads += 1
+            else:
+                page = bytearray(PAGE_SIZE)
+                self.num_pages = page_num + 1
+            self._cache[page_num] = page
+            self._evict_if_full()
             return page
-        self.misses += 1
-        if page_num < self.num_pages:
-            self._file.seek(page_num * PAGE_SIZE)
-            data = self._file.read(PAGE_SIZE)
-            page = bytearray(data.ljust(PAGE_SIZE, b"\0"))   # page may not be on disk yet
-            self.reads += 1
-        else:
-            page = bytearray(PAGE_SIZE)
-            self.num_pages = page_num + 1
-        self._cache[page_num] = page
-        self._evict_if_full()
-        return page
 
     def allocate_page(self) -> int:
-        page_num = self.num_pages
-        self.get_page(page_num)
-        return page_num
+        with self._mutex:
+            page_num = self.num_pages
+            self.get_page(page_num)
+            return page_num
 
     def mark_dirty(self, page_num: int, page: bytearray) -> None:
         """Call AFTER changing a page. Passing the page itself means a change is never
         lost, even if the page was evicted while the caller was still working on it."""
-        if self._cache.get(page_num) is not page:
-            self._cache[page_num] = page                # put it back in the cache
-        self._cache.move_to_end(page_num)
-        self._dirty.add(page_num)
-        self._evict_if_full()
+        with self._mutex:
+            if self._cache.get(page_num) is not page:
+                self._cache[page_num] = page                # put it back in the cache
+            self._cache.move_to_end(page_num)
+            self._dirty.add(page_num)
+            self._evict_if_full()
 
     def _evict_if_full(self) -> None:
         while len(self._cache) > self.capacity:
@@ -85,14 +91,16 @@ class Pager:
         return self.hits / total if total else 0.0
 
     def flush(self) -> None:
-        for page_num in sorted(self._dirty):
-            self._write(page_num, self._cache[page_num])
-        self._dirty.clear()
-        self._file.flush()
-        os.fsync(self._file.fileno())
+        with self._mutex:
+            for page_num in sorted(self._dirty):
+                self._write(page_num, self._cache[page_num])
+            self._dirty.clear()
+            self._file.flush()
+            os.fsync(self._file.fileno())
 
     def close(self) -> None:
-        if self._file.closed:
-            return
-        self.flush()
-        self._file.close()
+        with self._mutex:
+            if self._file.closed:
+                return
+            self.flush()
+            self._file.close()
