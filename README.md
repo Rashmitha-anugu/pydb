@@ -1,6 +1,6 @@
 # pydb: a relational database built from scratch in Python
 
-![tests](https://github.com/<your-username>/pydb/actions/workflows/tests.yml/badge.svg)
+![tests](https://github.com/Rashmitha-anugu/pydb/actions/workflows/tests.yml/badge.svg)
 
 pydb is a small embedded database written from first principles, in about 1,850 lines of plain Python with no dependencies. It stores data in 4 KB pages, indexes it with B+Trees, runs SQL through its own parser and query planner, supports transactions, and survives crashes using a write-ahead log.
 
@@ -86,9 +86,9 @@ Measured on a Windows laptop.
 
 **Secondary index vs. full scan:** `bench_index.py`, 50,000 rows, lookup by email.
 ```
-without index    93.361 ms/lookup    1,803 pages/lookup   (full scan)
-with index        0.157 ms/lookup       12 pages/lookup   (index on email)
-Speedup: 595x
+without index    197.205 ms/lookup    1,803 pages/lookup   (full scan)
+with index        0.363 ms/lookup       12 pages/lookup   (index on email)
+Speedup: 544x
 ```
 
 **Buffer pool size:** `bench.py`, 20,000 random lookups on 50,000 rows (5,453 pages).
@@ -118,7 +118,7 @@ locking ON :  row counter 3200/3200, findable 3200, seen by select 3200, in inde
 Requires Python 3.10 or later. The database itself has no dependencies; pytest is used only for the tests.
 
 ```bash
-git clone https://github.com/<your-username>/pydb.git
+git clone https://github.com/Rashmitha-anugu/pydb.git
 cd pydb
 python -m pydb shop.db          # then type:  .read demo.sql
 ```
